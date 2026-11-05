@@ -19,7 +19,7 @@ from connections import INDICATOR_CHECK_ID
 from consts import DefaultItems
 from editoritems import DesiredFacing, InstCount, Item as EditorItem
 from packages import PackagesSet, Style, TRANS_OBJ_NOT_FOUND
-from packages.item import Item, ItemConfig
+from packages.item import Item, ItemConfig, ItemVariant
 from transtoken import AppError, TransToken
 import config
 import utils
@@ -82,13 +82,13 @@ def apply_replacements(conf: Keyvalues, item_id: str) -> Keyvalues:
     return new_conf
 
 
-def get_export_data(
+def resolve_item_definitions(
     item: Item,
     pal_list: Item.ExportInfo,
     style_id: utils.ObjectID,
     prop_conf: ItemDefault,
-) -> tuple[utils.ObjectID, list[EditorItem], lazy_conf.LazyConf]:
-    """Get the data for an exported item."""
+) -> tuple[ItemVariant, list[EditorItem]]:
+    """Resolve definitions, palette and defaults without loading compiler conditions."""
 
     # Build a dictionary of this item's palette positions,
     # if any exist.
@@ -130,10 +130,23 @@ def get_export_data(
             except KeyError:
                 pass
     return (
-        item_data.pak_id,
+        item_data,
         [new_item] + item_data.editor_extra,
-        # Add all_conf first so it's conditions run first by default
-        lazy_conf.concat(item.all_conf, item_data.vbsp_config),
+    )
+
+
+def get_export_data(
+    item: Item,
+    pal_list: Item.ExportInfo,
+    style_id: utils.ObjectID,
+    prop_conf: ItemDefault,
+) -> tuple[utils.ObjectID, list[EditorItem], lazy_conf.LazyConf]:
+    """Get the data for an exported item."""
+    variant, definitions = resolve_item_definitions(item, pal_list, style_id, prop_conf)
+    return (
+        variant.pak_id, definitions,
+        # Shared conditions retain their original precedence.
+        lazy_conf.concat(item.all_conf, variant.vbsp_config),
     )
 
 

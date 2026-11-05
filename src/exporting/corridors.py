@@ -15,7 +15,7 @@ from corridor import (
 )
 from transtoken import AppError, TransToken
 from . import ExportData, STEPS, StepResource
-from packages.corridor import CorridorGroup
+from packages.corridor import CorridorGroup, CorridorUI
 import config
 import editoritems
 import packages
@@ -51,6 +51,32 @@ async def assemble_corridors(
     vbsp_conf: srctools.Keyvalues,
 ) -> tuple[ExportedConf, config.Config]:
     """Assemble corridor configuration and editor instances without game writes."""
+    result, compiler_config, selected = await _resolve_corridor_content(
+        packset, selected_style, all_items, compiler_config,
+    )
+    for corridor in selected:
+        vbsp_conf.extend(await corridor.config())
+    return result, compiler_config
+
+
+async def resolve_corridor_content(
+    packset: packages.PackagesSet,
+    selected_style: packages.Style,
+    all_items: list[editoritems.Item],
+    options: config.Config,
+) -> tuple[ExportedConf, config.Config]:
+    """Resolve definitions and option defaults without reading compiler conditions."""
+    result, options, _ = await _resolve_corridor_content(packset, selected_style, all_items, options)
+    return result, options
+
+
+async def _resolve_corridor_content(
+    packset: packages.PackagesSet,
+    selected_style: packages.Style,
+    all_items: list[editoritems.Item],
+    compiler_config: config.Config,
+) -> tuple[ExportedConf, config.Config, list[CorridorUI]]:
+    await trio.lowlevel.checkpoint()
     style_id = selected_style.id
     try:
         group = packset.obj_by_id(CorridorGroup, style_id)
@@ -60,6 +86,7 @@ async def assemble_corridors(
         )) from None
 
     export: dict[CorrKind, list[Corridor]] = {}
+    selected = []
     for mode, direction, attach in itertools.product(GameMode, Direction, Attachment):
         conf = config.APP.get_cur_conf(
             Config,
@@ -106,7 +133,7 @@ async def assemble_corridors(
             options_changed = True
 
         for corr in chosen:
-            vbsp_conf.extend(await corr.config())
+            selected.append(corr)
             for option in group.get_options(mode, direction, corr):
                 # If an option is not present in the config, add it.
                 if option.id not in exported_options:
@@ -155,4 +182,4 @@ async def assemble_corridors(
             item.handle = editoritems.Handle.QUAD
         # Set desired facing to make them face upright, no matter what.
         item.facing = editoritems.DesiredFacing.UP
-    return result, compiler_config
+    return result, compiler_config, selected

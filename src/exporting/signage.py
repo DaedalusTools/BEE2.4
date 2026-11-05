@@ -48,8 +48,8 @@ EDITOR_SHAPES = [
 ]
 
 
-def serialise(sign: Signage, parent: Keyvalues, style: Style) -> SignStyle | None:
-    """Write this sign's data for the style to the provided property."""
+def resolve_sign_style(sign: Signage, style: Style) -> SignStyle | None:
+    """Select authored signage assets without constructing compiler configuration."""
     for potential_style in style.bases:
         try:
             data = sign.styles[potential_style.reference()]
@@ -66,9 +66,16 @@ def serialise(sign: Signage, parent: Keyvalues, style: Style) -> SignStyle | Non
             data = sign.styles[PakRef(Style, CLEAN_STYLE)]
         except KeyError:
             return None
-    parent.append(Keyvalues('world', data.world))
-    parent.append(Keyvalues('overlay', data.overlay))
-    parent.append(Keyvalues('type', data.type))
+    return data
+
+
+def serialise(sign: Signage, parent: Keyvalues, style: Style) -> SignStyle | None:
+    """Write this sign's data for the style to the provided property."""
+    data = resolve_sign_style(sign, style)
+    if data is not None:
+        parent.append(Keyvalues('world', data.world))
+        parent.append(Keyvalues('overlay', data.overlay))
+        parent.append(Keyvalues('type', data.type))
     return data
 
 
@@ -92,6 +99,36 @@ async def assemble_signage(
     packset: PackagesSet, style: Style, selection: Iterable[tuple[str, str]],
 ) -> tuple[Keyvalues, dict[int, ImgHandle]]:
     """Resolve compiler signage separately from editor legend rendering."""
+    selected, icons = await _resolve_signage_content(packset, style, selection)
+    conf = Keyvalues('Signage', [])
+    for timer, primary, children in selected:
+        block = Keyvalues(timer, [])
+        if primary is not None:
+            block.extend([
+                Keyvalues('world', primary.world), Keyvalues('overlay', primary.overlay),
+                Keyvalues('type', primary.type),
+            ])
+        for name, child in children:
+            block.append(Keyvalues(name, [
+                Keyvalues('world', child.world), Keyvalues('overlay', child.overlay),
+                Keyvalues('type', child.type),
+            ]))
+        if block:
+            conf.append(block)
+    return conf, icons
+
+
+async def resolve_signage_icons(
+    packset: PackagesSet, style: Style, selection: Iterable[tuple[str, str]],
+) -> dict[int, ImgHandle]:
+    """Resolve legend artwork without assembling compiler signage."""
+    _, icons = await _resolve_signage_content(packset, style, selection)
+    return icons
+
+
+async def _resolve_signage_content(
+    packset: PackagesSet, style: Style, selection: Iterable[tuple[str, str]],
+) -> tuple[list[tuple[str, SignStyle | None, list[tuple[str, SignStyle]]]], dict[int, ImgHandle]]:
     # Timer value -> sign ID.
     sel_ids: list[tuple[str, str]] = [
         *selection,
@@ -101,7 +138,7 @@ async def assemble_signage(
 
     sel_icons: dict[int, ImgHandle] = {}
 
-    conf = Keyvalues('Signage', [])
+    selected = []
     errors = []
 
     for tim_id, sign_id in sel_ids:
@@ -111,9 +148,8 @@ async def assemble_signage(
         except KeyError:
             errors.append(AppError(TRANS_MISSING_SELECTED.format(id=sign_id)))
             continue
-        kv_block = Keyvalues(str(tim_id), [])
-
-        sty_sign = serialise(sign, kv_block, style)
+        sty_sign = resolve_sign_style(sign, style)
+        children = []
 
         for sub_name, sub_id in [
             ('primary', sign.prim_id),
@@ -129,13 +165,11 @@ async def assemble_signage(
                         sub_id=sub_id,
                     )))
                 else:
-                    sub_block = Keyvalues(sub_name, [])
-                    serialise(sub_sign, sub_block, style)
-                    if sub_block:
-                        kv_block.append(sub_block)
+                    child_style = resolve_sign_style(sub_sign, style)
+                    if child_style is not None:
+                        children.append((sub_name, child_style))
 
-        if kv_block:
-            conf.append(kv_block)
+        selected.append((str(tim_id), sty_sign, children))
 
         # Valid timer number, store to be placed on the texture.
         if tim_id.isdigit() and sty_sign is not None:
@@ -144,7 +178,7 @@ async def assemble_signage(
     if errors:
         raise ExceptionGroup('Signage Export', errors)
 
-    return conf, sel_icons
+    return selected, sel_icons
 
 
 @STEPS.add_step(prereq=[StepResource.VPK_WRITTEN], results=[StepResource.VCONF_DATA, StepResource.RES_SPECIAL])

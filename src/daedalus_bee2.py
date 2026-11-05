@@ -120,6 +120,19 @@ class CleanProfileConfiguration:
     renderables: tuple[tuple[editoritems.RenderableType, editoritems.Renderable], ...]
 
 
+@dataclass(frozen=True)
+class CleanContentSelection:
+    """Resolved definitions, options and artwork; no executable compiler configuration."""
+    editors: tuple[editoritems.Item, ...]
+    options: config.Config
+    corridors: corridor.ExportedConf
+    warnings: tuple[str, ...]
+    package_set: packages.PackagesSet
+    item_versions: tuple[tuple[str, str], ...]
+    signage_icons: tuple[tuple[int, img.Handle], ...]
+    renderables: tuple[tuple[editoritems.RenderableType, editoritems.Renderable], ...]
+
+
 class CompilerInputError(ValueError):
     """A BEE2 map/configuration error, not alternate error-map success."""
     def __init__(self, details: user_errors.ErrorInfo) -> None:
@@ -210,6 +223,48 @@ def template_session(packset: packages.PackagesSet):
         yield
 
 
+async def resolve_clean_content(
+    packset: packages.PackagesSet,
+    versions: Mapping[str, str] | None = None,
+    *,
+    widget_values: Mapping[str, str | Mapping[str, str]] | None = None,
+) -> CleanContentSelection:
+    """Resolve catalog content without reading item/style/corridor conditions."""
+    import config
+    import packages
+    from config.signage import Layout
+    from exporting.corridors import resolve_corridor_content
+    from exporting.items import resolve_item_definitions, TRANS_OLD_STYLE_DEF
+    from exporting.player import assemble_player_models
+    from exporting.signage import resolve_signage_icons
+    from exporting.widget_conf import apply_widget_defaults, apply_widget_values
+
+    style, defaults, palette, selections = _clean_item_choices(packset, versions)
+    editors = copy.deepcopy(style.items)
+    style_items = {editor.id: editor for editor in editors}
+    warnings = []
+    for item_id, _ in selections:
+        item = packset.obj_by_id(packages.Item, item_id)
+        variant, definitions = resolve_item_definitions(item, palette, style.id, defaults[item_id])
+        for definition in definitions:
+            if definition.id in style_items:
+                warnings.append(f"{variant.pak_id}: {TRANS_OLD_STYLE_DEF.format(item=definition.id)}")
+                editors.remove(style_items.pop(definition.id))
+            editors.append(definition)
+    options = await apply_widget_defaults(packset, config.APP.get_full_conf(config.COMPILER))
+    if widget_values is not None:
+        options = apply_widget_values(packset, options, widget_values)
+    options = await assemble_player_models(packset, options)
+    corridors, options = await resolve_corridor_content(packset, style, editors, options)
+    icons = await resolve_signage_icons(
+        packset, style, [(str(timer), sign_id) for timer, sign_id in Layout().signs.items() if sign_id],
+    )
+    return CleanContentSelection(
+        tuple(editors), options, corridors, tuple(warnings), packset, tuple(selections),
+        tuple(icons.items()), tuple(copy.deepcopy(style.renderables).items()),
+    )
+
+
 async def assemble_clean_profile_configuration(
     packset: packages.PackagesSet,
     versions: Mapping[str, str] | None = None,
@@ -276,9 +331,23 @@ async def assemble_clean_items(
     versions: Mapping[str, str] | None = None,
 ) -> ItemExport:
     """Assemble item/style definitions, not a complete game/compile export."""
+    from exporting.items import assemble_items
+
+    style, defaults, palette, selections = _clean_item_choices(packset, versions)
+    editors = copy.deepcopy(style.items)
+    compiler_config = await style.config()
+    warnings = []
+    await assemble_items(
+        packset, style, palette, defaults, editors, compiler_config,
+        lambda package_id, warning: warnings.append(f"{package_id}: {warning}"),
+    )
+    return ItemExport(tuple(editors), compiler_config, tuple(warnings), tuple(selections))
+
+
+def _clean_item_choices(packset, versions):
+    """Choose definitions once; do not load their lazy compiler configuration."""
     import packages
     from config.item_defaults import ItemDefault
-    from exporting.items import assemble_items
 
     versions = versions or {}
     items = sorted(packset.all_obj(packages.Item), key=lambda item: item.id)
@@ -298,14 +367,7 @@ async def assemble_clean_items(
             position += 1
         palette[item.id.casefold()] = positions
     style = packset.obj_by_id(packages.Style, packages.CLEAN_STYLE)
-    editors = copy.deepcopy(style.items)
-    compiler_config = await style.config()
-    warnings = []
-    await assemble_items(
-        packset, style, palette, defaults, editors, compiler_config,
-        lambda package_id, warning: warnings.append(f"{package_id}: {warning}"),
-    )
-    return ItemExport(tuple(editors), compiler_config, tuple(warnings), tuple(selections))
+    return style, defaults, palette, selections
 
 
 @asynccontextmanager
