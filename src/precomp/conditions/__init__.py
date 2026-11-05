@@ -794,9 +794,12 @@ def check_all(
                     # EndCondition is raised to immediately stop running
                     # this condition, and skip to the next condition.
                     break
-                except Exception:
+                except Exception as error:
                     # Print the source of the condition if it fails...
                     LOGGER.exception('Error in {}:', condition.source or 'condition')
+                    import daedalus_bee2
+                    if daedalus_bee2.is_configured():
+                        raise RuntimeError(f"Error in {condition.source or 'condition'}.") from error
                     # Exit directly, so we don't print it again in the exception
                     # handler
                     utils.quit_app(1)

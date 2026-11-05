@@ -6,13 +6,18 @@ ResourceT: An enum which defines the resources passed in/out.
 from collections.abc import Awaitable, Callable, Collection, Iterable
 from collections import Counter
 import math
+from typing import Protocol
 
 import attrs
 import srctools.logger
 import trio
 
 import async_util
-from loadScreen import ScreenStage
+
+
+class StepProgress(Protocol):
+    async def set_length(self, num: int) -> None: ...
+    async def step(self, info: object = None) -> None: ...
 
 
 type Func[CtxT] = Callable[[CtxT], Awaitable[object]]
@@ -34,7 +39,7 @@ class Step[CtxT, ResourceT]:
         self,
         ctx: CtxT,
         result_chan: trio.abc.SendChannel[Collection[ResourceT]],
-        stage: ScreenStage | None,
+        stage: StepProgress | None,
     ) -> None:
         """Wraps the step functionality."""
         await async_util.run_as_task(self.func, ctx)
@@ -80,7 +85,7 @@ class StepOrder[CtxT, ResourceT]:
 
         return deco
 
-    async def run(self, ctx: CtxT, stage: ScreenStage | None = None) -> None:
+    async def run(self, ctx: CtxT, stage: StepProgress | None = None) -> None:
         """Run the tasks."""
         self._locked = True
         # For each resource, the number of steps producing it that haven't been completed.

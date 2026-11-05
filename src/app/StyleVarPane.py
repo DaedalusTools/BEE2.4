@@ -19,57 +19,7 @@ import config
 
 LOGGER = get_logger(__name__)
 
-# Special StyleVars that are hardcoded into the BEE2.
-# These are effectively attributes of Portal 2 itself, and always work
-# in every style.
-styleOptions = [
-    StyleVar.unstyled(
-        id='MultiverseCave',
-        name=TransToken.ui('Multiverse Cave'),
-        default=True,
-        desc=TransToken.ui('Play the Workshop Cave Johnson lines on map start.'),
-    ),
-
-    StyleVar.unstyled(
-        id='NoMidVoices',
-        name=TransToken.ui('Suppress Mid-Chamber Dialogue'),
-        default=False,
-        desc=TransToken.ui('Disable all voicelines other than entry and exit lines.'),
-    ),
-
-    StyleVar.unstyled(
-        id='AllowGooMist',
-        name=TransToken.ui('Allow Adding Goo Mist'),
-        default=True,
-        desc=TransToken.ui(
-            'Add mist particles above Toxic Goo in certain styles. This can '
-            'increase the entity count significantly with large, complex goo '
-            'pits, so disable if needed.'
-        ),
-    ),
-
-    StyleVar.unstyled(
-        id='FunnelAllowSwitchedLights',
-        name=TransToken.ui('Light Reversible Excursion Funnels'),
-        default=True,
-        desc=TransToken.ui(
-            'Funnels emit a small amount of light. However, if multiple funnels '
-            'are near each other and can reverse polarity, this can cause '
-            'lighting issues. Disable this to prevent that by disabling '
-            'lights. Non-reversible Funnels do not have this issue.'
-        ),
-    ),
-
-    StyleVar.unstyled(
-        id='EnableShapeSignageFrame',
-        name=TransToken.ui('Enable Shape Framing'),
-        default=True,
-        desc=TransToken.ui(
-            'After 10 shape-type antlines are used, the signs repeat. With this'
-            ' enabled, colored frames will be added to distinguish them.'
-        ),
-    ),
-]
+from packages.stylevar import BUILTIN_STYLE_VARS as styleOptions
 
 
 class _WidgetsDict(TypedDict):

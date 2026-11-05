@@ -1,9 +1,10 @@
 """Export selected elevator videos."""
 import trio.lowlevel
+from srctools import Keyvalues
 
 from transtoken import AppError
 from . import ExportData, STEPS, StepResource
-from packages import Elevator, TRANS_OBJ_NOT_FOUND
+from packages import Elevator, Style, TRANS_OBJ_NOT_FOUND
 import utils
 
 
@@ -22,17 +23,22 @@ async def step_elevator_video(exp_data: ExportData) -> None:
             raise AppError(TRANS_OBJ_NOT_FOUND.format(object="Elevator", id=sel_id)) from None
     await trio.lowlevel.checkpoint()
 
-    if exp_data.selected_style.has_video:
+    assemble_elevator(exp_data.selected_style, elevator, exp_data.vbsp_conf)
+
+
+def assemble_elevator(style: Style, elevator: Elevator | None, vbsp_conf: Keyvalues) -> None:
+    """Assemble video options without requiring a game installation."""
+    if style.has_video:
         if elevator is None:
             # Use a randomised video
-            exp_data.vbsp_conf.set_key(('Elevator', 'type'), 'RAND')
+            vbsp_conf.set_key(('Elevator', 'type'), 'RAND')
         elif elevator.id == 'VALVE_BLUESCREEN':
             # This video gets a special script and handling
-            exp_data.vbsp_conf.set_key(('Elevator', 'type'), 'BSOD')
+            vbsp_conf.set_key(('Elevator', 'type'), 'BSOD')
         else:
             # Use the particular selected video
-            exp_data.vbsp_conf.set_key(('Elevator', 'type'), 'FORCE')
-            exp_data.vbsp_conf.set_key(('Elevator', 'horiz'), elevator.horiz_video)
-            exp_data.vbsp_conf.set_key(('Elevator', 'vert'), elevator.vert_video)
+            vbsp_conf.set_key(('Elevator', 'type'), 'FORCE')
+            vbsp_conf.set_key(('Elevator', 'horiz'), elevator.horiz_video)
+            vbsp_conf.set_key(('Elevator', 'vert'), elevator.vert_video)
     else:  # No elevator video for this style
-        exp_data.vbsp_conf.set_key(('Elevator', 'type'), 'NONE')
+        vbsp_conf.set_key(('Elevator', 'type'), 'NONE')

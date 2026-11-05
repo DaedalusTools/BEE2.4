@@ -31,6 +31,7 @@ import trio
 
 from consts import Theme
 import utils
+import daedalus_bee2
 
 
 # Used to deduplicate handles with existing ones. But if they're totally unused, let them die.
@@ -211,6 +212,8 @@ def _load_file(
                 if image.mode != 'RGBA':
                     image = image.convert('RGBA')
     except Exception:
+        if daedalus_bee2.is_configured():
+            raise
         LOGGER.warning(
             'Could not parse image file {}:',
             uri,
@@ -829,6 +832,8 @@ class ImgFile(Handle):
         try:
             fsys = PACK_SYSTEMS[self.uri.package]
         except KeyError:
+            if daedalus_bee2.is_configured():
+                raise ValueError(f'Unknown package for loading images: {self.uri}') from None
             LOGGER.warning('Unknown package for loading images: "{}"!', self.uri)
             return Handle.error(self.width, self.height).get_pil()
 
@@ -836,6 +841,8 @@ class ImgFile(Handle):
         if file is not None:
             img = _load_file(file, self.uri, self.width, self.height)
         else:
+            if daedalus_bee2.is_configured():
+                raise FileNotFoundError(f'Package image does not exist: {self.uri}')
             img = Handle.error(self.width, self.height).get_pil()
         if uses_theme:
             self._uses_theme = True
@@ -956,6 +963,8 @@ class ImgComposite(Handle):
         img = Image.new('RGBA', size)
         for layer, child in zip(self.layers, children, strict=True):
             if Fraction(child.width, child.height) != ratio:
+                if daedalus_bee2.is_configured():
+                    raise ValueError(f'Mismatched layered image ratios for {self!r}')
                 LOGGER.warning(
                     'Mismatch in layered image ratios: target={}x{}, '
                     'layer={}x{} for {!r}',

@@ -1,6 +1,7 @@
 """Generates various resources depending on package options."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from PIL import Image, ImageDraw
 import colorsys
 import io
@@ -49,6 +50,20 @@ async def make_cube_colourizer_legend(exp_data: ExportData) -> None:
         for tim, holder in wid.holders.items()
     }
 
+    vtf = render_colourizer_legend(colors)
+    vtf_loc = trio.Path(exp_data.game.abs_path(
+        'bee2/materials/BEE2/models/props_map_editor/cube_coloriser_legend.vtf'
+    ))
+    exp_data.resources.add(vtf_loc)
+    await vtf_loc.parent.mkdir(parents=True, exist_ok=True)
+    LOGGER.info('Exporting "{}"...', vtf_loc)
+    buf = io.BytesIO()
+    await trio.to_thread.run_sync(vtf.save, buf)
+    await vtf_loc.write_bytes(buf.getvalue())
+
+
+def render_colourizer_legend(colors: Mapping[int, tuple[int, int, int]]) -> VTF:
+    """Render the editor texture separately from the installation export."""
     legend = Image.new('RGB', (LEGEND_SIZE, LEGEND_SIZE), color=(255, 255, 255))
     draw = ImageDraw.Draw(legend)
 
@@ -95,12 +110,4 @@ async def make_cube_colourizer_legend(exp_data: ExportData) -> None:
         frame = vtf.get(mipmap=i)
         frame.copy_from(b'\xFF' * (frame.width*frame.height), ImageFormats.I8)
 
-    vtf_loc = trio.Path(exp_data.game.abs_path(
-        'bee2/materials/BEE2/models/props_map_editor/cube_coloriser_legend.vtf'
-    ))
-    exp_data.resources.add(vtf_loc)
-    await vtf_loc.parent.mkdir(parents=True, exist_ok=True)
-    LOGGER.info('Exporting "{}"...', vtf_loc)
-    buf = io.BytesIO()
-    await trio.to_thread.run_sync(vtf.save, buf)
-    await vtf_loc.write_bytes(buf.getvalue())
+    return vtf

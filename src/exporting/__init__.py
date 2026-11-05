@@ -20,8 +20,8 @@ from packages import ExportKey, _ExportValue, Style
 from step_order import StepOrder
 from transtoken import TransToken
 import config as config_mod
-import loadScreen
 import packages
+import utils
 
 
 LOGGER = srctools.logger.get_logger(__name__)
@@ -57,22 +57,23 @@ class StepResource(Enum):
     VPK_WRITTEN = auto()  # The VPK file has been generated for overriding editor textures.
 
 
-# The progress bars used when exporting data into a game
-STAGE_STEPS = loadScreen.ScreenStage(TransToken.ui('Overall Progress'))
-STAGE_COMP_BACKUP = loadScreen.ScreenStage(TransToken.ui('Backup Original Files'))
-STAGE_AUTO_BACKUP = loadScreen.ScreenStage(TransToken.ui('Backup Puzzles'))
-STAGE_COMPILER = loadScreen.ScreenStage(TransToken.ui('Copy Compiler'))
-STAGE_RESOURCES = loadScreen.ScreenStage(TransToken.ui('Copy Resources'))
-STAGE_MUSIC = loadScreen.ScreenStage(TransToken.ui('Copy Music'))
-load_screen = loadScreen.LoadScreen(
-    STAGE_STEPS,
-    STAGE_COMP_BACKUP,
-    STAGE_AUTO_BACKUP,
-    STAGE_COMPILER,
-    STAGE_RESOURCES,
-    STAGE_MUSIC,
-    title_text=TransToken.ui('Exporting'),
-)
+if not utils.HEADLESS:
+    import loadScreen
+    STAGE_STEPS = loadScreen.ScreenStage(TransToken.ui('Overall Progress'))
+    STAGE_COMP_BACKUP = loadScreen.ScreenStage(TransToken.ui('Backup Original Files'))
+    STAGE_AUTO_BACKUP = loadScreen.ScreenStage(TransToken.ui('Backup Puzzles'))
+    STAGE_COMPILER = loadScreen.ScreenStage(TransToken.ui('Copy Compiler'))
+    STAGE_RESOURCES = loadScreen.ScreenStage(TransToken.ui('Copy Resources'))
+    STAGE_MUSIC = loadScreen.ScreenStage(TransToken.ui('Copy Music'))
+    load_screen = loadScreen.LoadScreen(
+        STAGE_STEPS,
+        STAGE_COMP_BACKUP,
+        STAGE_AUTO_BACKUP,
+        STAGE_COMPILER,
+        STAGE_RESOURCES,
+        STAGE_MUSIC,
+        title_text=TransToken.ui('Exporting'),
+    )
 
 
 @attrs.define(kw_only=True)
@@ -149,6 +150,8 @@ async def export(info: ExportInfo) -> ErrorResult:
 
     - If no backup is present, the original editoritems is backed up.
     """
+    if utils.HEADLESS:
+        raise RuntimeError('Game installation export is unavailable in the headless backend.')
     LOGGER.info('-' * 20)
     LOGGER.info('Exporting Items and Style for "{}"!', info.game.name)
 
@@ -219,8 +222,11 @@ async def step_add_core_info(exp: ExportData) -> None:
 
 
 # Register everything.
-from exporting import (  # noqa: E402
-    barrier_hole, compiler, corridors, cube_colourizer, editor_sound, elevator,  # noqa: F401
-    fgd, files, fizzler, gameinfo, items, music, pack_list, player, quote_pack,  # noqa: F401
-    signage,  skybox, stylevar, template_brush, translations, vpks, widget_conf,  # noqa: F401
-)
+if utils.HEADLESS:
+    from exporting import items
+else:
+    from exporting import (  # noqa: E402
+        barrier_hole, compiler, corridors, cube_colourizer, editor_sound, elevator,  # noqa: F401
+        fgd, files, fizzler, gameinfo, items, music, pack_list, player, quote_pack,  # noqa: F401
+        signage,  skybox, stylevar, template_brush, translations, vpks, widget_conf,  # noqa: F401
+    )

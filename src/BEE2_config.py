@@ -65,6 +65,8 @@ class ConfigFile(ConfigParser):
         self.has_changed = Event()
         self._file_lock = Lock()
 
+        if utils.HEADLESS:
+            filename = None
         if filename is not None:
             if in_conf_folder:
                 self.filename = utils.conf_location('config') / filename

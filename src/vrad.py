@@ -3,6 +3,8 @@
 This allows us to change the arguments passed in,
 edit the BSP after instances are collapsed, and pack files.
 """
+from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable
 from io import BytesIO
 from zipfile import ZipFile
 from pathlib import Path
@@ -12,9 +14,9 @@ import sys
 from srctools import Vec
 from srctools.bsp import BSP, BSP_LUMPS
 from srctools.const import SurfFlags
-from srctools.filesys import RawFileSystem, ZipFileSystem, FileSystem
+from srctools.filesys import RawFileSystem, ZipFileSystem, FileSystem, FileSystemChain
 from srctools.packlist import PackList
-from srctools.game import find_gameinfo
+from srctools.game import Game, find_gameinfo
 from srctools.logger import get_logger
 import srctools.run
 import trio
@@ -31,6 +33,8 @@ LOGGER = get_logger()
 
 TEX_INVISIBLE_TOOLS = 'tools/toolsinvisible'
 TEX_INVISIBLE_PATCHED = 'bee2/invisible_noportal'
+_transforms_loaded = False
+_transforms_failed = False
 
 
 def swap_material(bsp: BSP, src: str, dest: str) -> None:
@@ -49,6 +53,12 @@ def load_transforms() -> None:
     We need to do this differently when frozen, since they're embedded in our
     executable.
     """
+    global _transforms_loaded, _transforms_failed
+    if _transforms_loaded:
+        return
+    if _transforms_failed:
+        raise RuntimeError('BSP transform registration previously failed.')
+    _transforms_failed = True
     if utils.FROZEN:
         # We embedded a copy of all the transforms in this package, which auto-imports the others.
         from postcomp import _ha_transforms  # noqa
@@ -66,10 +76,16 @@ def load_transforms() -> None:
         })
         sys.meta_path.append(finder)
         LOGGER.debug('Loading transforms from source: {}', transform_loc)
-        finder.load_all()
+        try:
+            finder.load_all()
+        except BaseException:
+            sys.meta_path.remove(finder)
+            raise
 
     # Load our additional BSP transforms.
     from postcomp import coop_responses, filter, user_error, debug_info, collisions_export  # noqa: F401
+    _transforms_loaded = True
+    _transforms_failed = False
 
 
 def run_vrad(args: list[str]) -> None:
@@ -83,6 +99,111 @@ def run_vrad(args: list[str]) -> None:
     else:
         LOGGER.warning("VRAD failed! ({})", code)
         sys.exit(code)
+
+
+@asynccontextmanager
+async def bsp_transform_session(
+    bsp_file: BSP, game: Game, filesystem: FileSystemChain,
+    *, soundscript_cache: Path | None = None, particle_cache: Path | None = None,
+    scan_dependencies: bool = True,
+    packlist_factory: Callable[[FileSystemChain], PackList] = PackList,
+) -> AsyncIterator[tuple[PackList, FileSystemChain, ZipFileSystem]]:
+    """Transform and gather dependencies before lighting; own only the BSP archive."""
+    zip_data = BytesIO()
+    zip_data.write(bsp_file.get_lump(BSP_LUMPS.PAKFILE))
+    zipfile = ZipFile(zip_data)
+
+    # Mount the existing packfile, so the cubemap files are recognised.
+    try:
+        pakfile_fs = ZipFileSystem('<BSP pakfile>', zipfile)
+        fsys = FileSystemChain(*filesystem.systems)
+        fsys.add_sys(pakfile_fs)
+        LOGGER.info('Done!')
+
+        LOGGER.debug('Filesystems:')
+        for child_sys in fsys.systems[:]:
+            LOGGER.debug('- {}: {!r}', child_sys[1], child_sys[0])
+
+        packlist = packlist_factory(fsys)
+        LOGGER.info('Reading soundscripts...')
+        packlist.load_soundscript_manifest(soundscript_cache)
+
+        # We need to add all soundscripts in scripts/bee2_snd/
+        # This way we can pack those, if required.
+        for folder in ['scripts/bee2_snd/', 'scripts/bee_snd/']:
+            for soundscript in fsys.walk_folder(folder):
+                if soundscript.path.endswith('.txt'):
+                    packlist.load_soundscript(soundscript, always_include=False)
+
+        LOGGER.info('Reading particles....')
+        packlist.load_particle_manifest(particle_cache)
+
+        LOGGER.info('Loading transforms...')
+        load_transforms()
+
+        LOGGER.info('Checking for music:')
+        music.generate(bsp_file.ents, packlist)
+
+        LOGGER.info('Run transformations...')
+        await run_transformations(bsp_file.ents, fsys, packlist, bsp_file, game)
+
+        if scan_dependencies:
+            LOGGER.info('Scanning map for files to pack:')
+            packlist.pack_from_bsp(bsp_file)
+            packlist.pack_from_ents(bsp_file.ents, bsp_file.filename.stem, ['P2'])
+            LOGGER.info('Done!')
+        else:
+            LOGGER.warning('Packing disabled!')
+
+        LOGGER.info('Analysing file dependencies....')
+        packlist.eval_dependencies()
+
+        packlist.write_soundscript_manifest()
+        packlist.write_particles_manifest(f'maps/{bsp_file.filename.stem}_particles.txt')
+
+        # Replace tools/toolsinvisible temporarily, the original blocks light annoyingly.
+        # Do it after packing, so it isn't packed. We'll swap back to the original,
+        # so it's not necessary.
+        swap_material(bsp_file, TEX_INVISIBLE_TOOLS, TEX_INVISIBLE_PATCHED)
+
+        yield packlist, fsys, pakfile_fs
+    finally:
+        zipfile.close()
+
+
+def finish_bsp(
+    path: Path, packlist: PackList,
+    *, whitelist: set[FileSystem], blacklist: set[FileSystem],
+    dump_loc: Path | None = None, ignore_vpk: bool = True,
+) -> BSP:
+    """Reopen and pack after Valve lighting, preserving its newly packed files."""
+    bsp_file = BSP(path)
+
+    # Cubemap files packed into the map already.
+    existing = set(bsp_file.pakfile.namelist())
+
+    # Pack to the BSP *after* running VRAD, to ensure an extra-large packfile doesn't crash
+    # VRAD.
+    LOGGER.info('Writing packed files to BSP...')
+    packlist.pack_into_zip(
+        bsp_file,
+        ignore_vpk=ignore_vpk,
+        whitelist=whitelist,
+        blacklist=blacklist,
+        dump_loc=dump_loc,
+    )
+    # Put this back.
+    swap_material(bsp_file, TEX_INVISIBLE_PATCHED, TEX_INVISIBLE_TOOLS)
+
+    LOGGER.info('Writing BSP...')
+    bsp_file.save()
+    LOGGER.info(' - BSP written!')
+
+    LOGGER.info('Packed files:\n{}', '\n'.join(
+        set(bsp_file.pakfile.namelist()) - existing
+    ))
+
+    return bsp_file
 
 
 async def main(argv: list[str]) -> None:
@@ -216,129 +337,58 @@ async def main(argv: list[str]) -> None:
             fsys.systems.remove(child_sys)
             fsys.systems.insert(0, child_sys)
 
-    zip_data = BytesIO()
-    zip_data.write(bsp_file.get_lump(BSP_LUMPS.PAKFILE))
-    zipfile = ZipFile(zip_data)
+    async with bsp_transform_session(
+        bsp_file, game, fsys,
+        soundscript_cache=root_folder / 'bin/bee2/sndscript_cache.dmx',
+        particle_cache=root_folder / 'bin/bee2/particle_cache.dmx',
+        scan_dependencies='-no_pack' not in args and (
+            not is_preview or config.getboolean("General", "packfile_auto_enable", True)
+        ),
+    ) as (packlist, fsys, pakfile_fs):
+        # We need to disallow Valve folders.
+        pack_whitelist: set[FileSystem] = set()
+        pack_blacklist: set[FileSystem] = {pakfile_fs}
 
-    # Mount the existing packfile, so the cubemap files are recognised.
-    pakfile_fs = ZipFileSystem('<BSP pakfile>', zipfile)
-    fsys.add_sys(pakfile_fs)
+        # Exclude absolutely everything except our folder.
+        for child_sys, _ in fsys.systems:
+            # Add 'bee2/' and 'bee2_dev/' only.
+            if (
+                isinstance(child_sys, RawFileSystem) and
+                'bee2' in os.path.basename(child_sys.path).casefold()
+            ):
+                pack_whitelist.add(child_sys)
+            else:
+                pack_blacklist.add(child_sys)
 
-    LOGGER.info('Done!')
-
-    LOGGER.debug('Filesystems:')
-    for child_sys in fsys.systems[:]:
-        LOGGER.debug('- {}: {!r}', child_sys[1], child_sys[0])
-
-    packlist = PackList(fsys)
-    LOGGER.info('Reading soundscripts...')
-    packlist.load_soundscript_manifest(root_folder / 'bin/bee2/sndscript_cache.dmx')
-
-    # We need to add all soundscripts in scripts/bee2_snd/
-    # This way we can pack those, if required.
-    for folder in ['scripts/bee2_snd/', 'scripts/bee_snd/']:
-        for soundscript in fsys.walk_folder(folder):
-            if soundscript.path.endswith('.txt'):
-                packlist.load_soundscript(soundscript, always_include=False)
-
-    LOGGER.info('Reading particles....')
-    packlist.load_particle_manifest(root_folder / 'bin/bee2/particle_cache.dmx')
-
-    LOGGER.info('Loading transforms...')
-    load_transforms()
-
-    LOGGER.info('Checking for music:')
-    music.generate(bsp_file.ents, packlist)
-
-    LOGGER.info('Run transformations...')
-    await run_transformations(bsp_file.ents, fsys, packlist, bsp_file, game)
-
-    if '-no_pack' not in args and (
-        not is_preview or config.getboolean("General", "packfile_auto_enable", True)
-    ):
-        LOGGER.info('Scanning map for files to pack:')
-        packlist.pack_from_bsp(bsp_file)
-        packlist.pack_from_ents(bsp_file.ents, Path(path).stem, ['P2'])
-        LOGGER.info('Done!')
-    else:
-        LOGGER.warning('Packing disabled!')
-
-    LOGGER.info('Analysing file dependencies....')
-    packlist.eval_dependencies()
-
-    packlist.write_soundscript_manifest()
-    packlist.write_particles_manifest(f'maps/{Path(path).stem}_particles.txt')
-
-    # Replace tools/toolsinvisible temporarily, the original blocks light annoyingly.
-    # Do it after packing, so it isn't packed. We'll swap back to the original,
-    # so it's not necessary.
-    swap_material(bsp_file, TEX_INVISIBLE_TOOLS, TEX_INVISIBLE_PATCHED)
-
-    # We need to disallow Valve folders.
-    pack_whitelist: set[FileSystem] = set()
-    pack_blacklist: set[FileSystem] = {pakfile_fs}
-
-    # Exclude absolutely everything except our folder.
-    for child_sys, _ in fsys.systems:
-        # Add 'bee2/' and 'bee2_dev/' only.
-        if (
-            isinstance(child_sys, RawFileSystem) and
-            'bee2' in os.path.basename(child_sys.path).casefold()
-        ):
-            pack_whitelist.add(child_sys)
+        if config.get_bool('General', 'packfile_dump_enable'):
+            dump_loc = Path(config.get_val(
+                'General',
+                'packfile_dump_dir',
+                '../dump/'
+            )).absolute()
         else:
-            pack_blacklist.add(child_sys)
+            dump_loc = None
 
-    if config.get_bool('General', 'packfile_dump_enable'):
-        dump_loc = Path(config.get_val(
-            'General',
-            'packfile_dump_dir',
-            '../dump/'
-        )).absolute()
-    else:
-        dump_loc = None
+        LOGGER.info('Writing BSP...')
+        bsp_file.save()
+        LOGGER.info(' - BSP written!')
 
-    LOGGER.info('Writing BSP...')
-    bsp_file.save()
-    LOGGER.info(' - BSP written!')
+        # VRAD only runs if light_args is not set to "NONE"
+        if light_args == 'FAST':
+            LOGGER.info("Running VRAD: forcing cheap lighting.")
+            run_vrad(fast_args)
+        elif light_args == 'FULL':
+            LOGGER.info("Running VRAD: full lighting enabled (publishing, or forced to do so)")
+            run_vrad(full_args)
+        else:
+            LOGGER.info("Running VRAD was skipped!")
 
-    # VRAD only runs if light_args is not set to "NONE"
-    if light_args == 'FAST':
-        LOGGER.info("Running VRAD: forcing cheap lighting.")
-        run_vrad(fast_args)
-    elif light_args == 'FULL':
-        LOGGER.info("Running VRAD: full lighting enabled (publishing, or forced to do so)")
-        run_vrad(full_args)
-    else:
-        LOGGER.info("Running VRAD was skipped!")
+        LOGGER.info("VRAD completed. Reopening and packing files.")
 
-    LOGGER.info("VRAD completed. Reopening and packing files.")
-
-    bsp_file = BSP(path)
-
-    # Cubemap files packed into the map already.
-    existing = set(bsp_file.pakfile.namelist())
-
-    # Pack to the BSP *after* running VRAD, to ensure an extra-large packfile doesn't crash
-    # VRAD.
-    LOGGER.info('Writing packed files to BSP...')
-    packlist.pack_into_zip(
-        bsp_file,
-        ignore_vpk=True,
-        whitelist=pack_whitelist,
-        blacklist=pack_blacklist,
-        dump_loc=dump_loc,
-    )
-    # Put this back.
-    swap_material(bsp_file, TEX_INVISIBLE_PATCHED, TEX_INVISIBLE_TOOLS)
-
-    LOGGER.info('Writing BSP...')
-    bsp_file.save()
-    LOGGER.info(' - BSP written!')
-
-    LOGGER.info('Packed files:\n{}', '\n'.join(
-        set(bsp_file.pakfile.namelist()) - existing
-    ))
+        bsp_file = finish_bsp(
+            Path(path), packlist, whitelist=pack_whitelist,
+            blacklist=pack_blacklist, dump_loc=dump_loc,
+        )
 
     screenshot.modify(config, game.path)
 

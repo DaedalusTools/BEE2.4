@@ -1,7 +1,7 @@
 """Export item definitions."""
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import PurePosixPath as FSPath
 import copy
 import operator
@@ -18,7 +18,7 @@ from config.widgets import WidgetConfig
 from connections import INDICATOR_CHECK_ID
 from consts import DefaultItems
 from editoritems import DesiredFacing, InstCount, Item as EditorItem
-from packages import TRANS_OBJ_NOT_FOUND
+from packages import PackagesSet, Style, TRANS_OBJ_NOT_FOUND
 from packages.item import Item, ItemConfig
 from transtoken import AppError, TransToken
 import config
@@ -177,14 +177,33 @@ async def step_write_items(exp_data: ExportData) -> None:
     For the selected attribute, this is a list of (item, subitem) tuples representing the
     palette.
     """
-    vbsp_config = exp_data.vbsp_conf
-    pal_list = exp_data.selected(Item.export_info)
+    await assemble_items(
+        exp_data.packset,
+        exp_data.selected_style,
+        exp_data.selected(Item.export_info),
+        {item.id: config.APP.get_cur_conf(ItemDefault, item.id)
+         for item in exp_data.packset.all_obj(Item)},
+        exp_data.all_items,
+        exp_data.vbsp_conf,
+        exp_data.warn_auth,
+    )
 
+
+async def assemble_items(
+    packset: PackagesSet,
+    selected_style: Style,
+    pal_list: Item.ExportInfo,
+    defaults: Mapping[str, ItemDefault],
+    all_items: list[EditorItem],
+    vbsp_config: Keyvalues,
+    warn_auth: Callable[[utils.SpecialID, TransToken], None],
+) -> None:
+    """Assemble resolved item definitions/config without installing them into a game."""
     missing = []
     # Check all palette items actually exist, otherwise fail.
     for item_id in pal_list:
         try:
-            exp_data.packset.obj_by_id(Item, item_id)
+            packset.obj_by_id(Item, item_id)
         except KeyError:
             missing.append(AppError(TRANS_OBJ_NOT_FOUND.format(object='Item', id=item_id.upper())))
     if missing:
@@ -194,28 +213,28 @@ async def step_write_items(exp_data: ExportData) -> None:
     # Check to prevent overlaps.
     style_items = {
         item.id: item
-        for item in exp_data.all_items
+        for item in all_items
     }
 
-    style_id = utils.obj_id(exp_data.selected_style.id)
+    style_id = utils.obj_id(selected_style.id)
     item: Item
-    for item in sorted(exp_data.packset.all_obj(Item), key=operator.attrgetter('id')):
-        prop_conf = config.APP.get_cur_conf(ItemDefault, item.id)
+    for item in sorted(packset.all_obj(Item), key=operator.attrgetter('id')):
+        prop_conf = defaults[item.id]
 
         (pak_id, items, config_part) = get_export_data(item, pal_list, style_id, prop_conf)
 
         for editor_def in items:
             if editor_def.id in style_items:
-                exp_data.warn_auth(pak_id, TRANS_OLD_STYLE_DEF.format(item=editor_def.id))
+                warn_auth(pak_id, TRANS_OLD_STYLE_DEF.format(item=editor_def.id))
                 # Pop so we warn only once.
-                exp_data.all_items.remove(style_items.pop(editor_def.id))
-            exp_data.all_items.append(editor_def)
+                all_items.remove(style_items.pop(editor_def.id))
+            all_items.append(editor_def)
 
         vbsp_config.extend(apply_replacements(await config_part(), item.id))
 
         # Add auxiliary configs as well.
         try:
-            aux_conf = exp_data.packset.obj_by_id(ItemConfig, item.id, warn=False)
+            aux_conf = packset.obj_by_id(ItemConfig, item.id, warn=False)
         except KeyError:
             pass
         else:
@@ -227,7 +246,7 @@ async def step_write_items(exp_data: ExportData) -> None:
             else:
                 # Find the first style definition for the selected one
                 # that's defined for this config
-                for poss_style in exp_data.selected_style.bases:
+                for poss_style in selected_style.bases:
                     if poss_style.id in version_data:
                         vbsp_config.extend(apply_replacements(
                             await version_data[poss_style.id](),

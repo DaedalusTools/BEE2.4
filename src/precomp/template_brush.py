@@ -4,6 +4,7 @@ from typing import Literal, assert_never
 
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Set as AbstractSet
 from collections import defaultdict
+from contextlib import contextmanager
 from decimal import Decimal
 from enum import Enum
 from operator import attrgetter
@@ -118,6 +119,7 @@ class UnparsedTemplate:
     id: str
     pak_path: str
     path: str
+    filesystem: FileSystem | None = None
 
 
 @attrs.define
@@ -539,10 +541,25 @@ async def load_templates(path: str) -> None:
         )
 
 
+@contextmanager
+def template_sources(sources: Iterable[UnparsedTemplate]) -> Iterator[None]:
+    """Temporarily use caller-owned template sources without reopening archives."""
+    global _TEMPLATES, _SCALE_TEMP
+    previous_templates, previous_scaling = _TEMPLATES, _SCALE_TEMP
+    _TEMPLATES = {source.id.casefold(): source for source in sources}
+    _SCALE_TEMP = {}
+    try:
+        yield
+    finally:
+        _TEMPLATES, _SCALE_TEMP = previous_templates, previous_scaling
+
+
 def _parse_template(loc: UnparsedTemplate) -> Template:
     """Parse a template VMF."""
     filesys: FileSystem
-    if os.path.isdir(loc.pak_path):
+    if loc.filesystem is not None:
+        filesys = loc.filesystem
+    elif os.path.isdir(loc.pak_path):
         filesys = RawFileSystem(loc.pak_path)
     else:
         ext = os.path.splitext(loc.pak_path)[1].casefold()
@@ -553,8 +570,12 @@ def _parse_template(loc: UnparsedTemplate) -> Template:
         else:
             raise ValueError(f'Unknown filesystem type for "{loc.pak_path}"!')
 
-    with filesys[loc.path].open_str() as f:
-        kv = Keyvalues.parse(f, f'{loc.pak_path}:{loc.path}')
+    try:
+        with filesys[loc.path].open_str() as f:
+            kv = Keyvalues.parse(f, f'{loc.pak_path}:{loc.path}')
+    finally:
+        if loc.filesystem is None and isinstance(filesys, ZipFileSystem):
+            filesys.zip.close()
     vmf = srctools.VMF.parse(kv, preserve_ids=True)
     del kv, filesys, f  # Discard all this data.
 

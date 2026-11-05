@@ -14,6 +14,7 @@ import trio
 
 from srctools import FrozenMatrix, FrozenVec, Keyvalues, Vec, conv_bool, conv_float
 from srctools.game import Game
+from srctools.filesys import FileSystem
 from srctools.tokenizer import TokenSyntaxError
 from srctools.vmf import Entity, UVAxis, VisGroup, VMF, Side, Solid
 from srctools.vmt import Material
@@ -949,14 +950,42 @@ def load_config(conf: Keyvalues) -> None:
     OVERLAYS = GENERATORS[GenCat.OVERLAYS]
 
 
-async def setup(game: Game, vmf: VMF, tiles: list[TileDef]) -> None:
+def prepare_material_output(root: Path, filename: Path) -> Path:
+    """Constrain writes using existing canonical parents, not missing-path resolution."""
+    relative = filename.relative_to(root)
+    if '..' in relative.parts:
+        raise ValueError(f'Generated material escapes output root: {filename}')
+    root = root.resolve(strict=True)
+    parent = root
+    for part in relative.parts[:-1]:
+        parent = parent / part
+        parent.mkdir(exist_ok=True)
+        if not parent.resolve(strict=True).is_relative_to(root):
+            raise ValueError(f'Generated material escapes output root: {filename}')
+    destination = parent / relative.name
+    if destination.is_symlink():
+        raise ValueError(f'Generated material is a symlink: {filename}')
+    return destination
+
+
+async def setup(
+    game: Game, vmf: VMF, tiles: list[TileDef],
+    *, material_folder: Path | None = None, filesystem: FileSystem | None = None,
+) -> None:
     """Do various setup steps, needed for generating textures.
 
     - Set randomisation seed on all the generators.
     - Build clumps.
     - Generate antigel materials.
     """
-    material_folder = (game.path / '..' / 'bee2' / 'materials').resolve()
+    if material_folder is None:
+        if utils.HEADLESS:
+            raise ValueError('Headless texturing requires an explicit material output root.')
+        material_folder = (game.path / '..' / 'bee2' / 'materials').resolve()
+    elif not material_folder.is_absolute():
+        raise ValueError('Material output root must be absolute.')
+    else:
+        material_folder = material_folder.resolve()
     antigel_loc = material_folder / ANTIGEL_PATH
     antigel_loc.mkdir(parents=True, exist_ok=True)
 
@@ -997,11 +1026,12 @@ async def setup(game: Game, vmf: VMF, tiles: list[TileDef]) -> None:
     async with trio.open_nursery() as nursery:
         # Parse the filesystems (importantly the VPKs) in the background while we check the existing
         # VMTs.
-        fsys_res = async_util.sync_result(nursery, game.get_filesystem)
+        fsys_res = async_util.sync_result(nursery, game.get_filesystem) if filesystem is None else None
         for vmt_file in antigel_loc.glob('*.vmt'):
             nursery.start_soon(check_existing, vmt_file)
 
-    fsys = fsys_res.result()
+    fsys = filesystem if fsys_res is None else fsys_res.result()
+    assert fsys is not None
     materials: set[str] = set()
 
     for generator in GENERATORS.values():
@@ -1055,7 +1085,7 @@ async def setup(game: Game, vmf: VMF, tiles: list[TileDef]) -> None:
                 antigel_mat = Path(antigel_filename).relative_to(material_folder).with_suffix('').as_posix()
                 if antigel_mat not in antigel_mats:
                     break
-        dest = trio.Path(antigel_filename.with_suffix('.vmt'))
+        dest = trio.Path(prepare_material_output(material_folder, antigel_filename.with_suffix('.vmt')))
         antigel_mats.add(antigel_mat)  # Do first, make sure nobody else claims!
         await dest.parent.mkdir(parents=True, exist_ok=True)
         await dest.write_text(ANTIGEL_TEMPLATE.format(

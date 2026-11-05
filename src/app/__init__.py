@@ -36,7 +36,7 @@ DEV_MODE = AsyncBool(value=utils.DEV_MODE)
 ICO_PATH = utils.bins_path('BEE2.ico')
 
 
-if utils.WIN:
+if utils.WIN and not utils.HEADLESS:
     import ctypes
     # Use Windows APIs to tell the taskbar to group us as our own program,
     # not with python.exe. Then our icon will apply, and also won't group

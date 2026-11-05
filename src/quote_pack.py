@@ -392,3 +392,13 @@ class QuoteInfo:
     responses: dict[Response, list[Line]]
     midchamber: list[Quote]
     monitor: Monitor | None
+
+    @classmethod
+    def blank(cls) -> QuoteInfo:
+        """Return the compiler definition for no selected voice pack."""
+        return cls(
+            id='', cave_skin=None, use_dings=False, use_microphones=False,
+            global_bullseye='', chars=set(), base_inst='', position=Vec(),
+            groups={}, events={}, response_use_dings=False, responses={},
+            midchamber=[], monitor=None,
+        )

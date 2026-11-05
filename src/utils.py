@@ -20,6 +20,7 @@ import math
 import os
 import stat
 import sys
+import daedalus_bee2
 
 from srctools import Angle, conv_bool
 import trio_util
@@ -87,8 +88,11 @@ copyreg.add_extension('pathlib', 'PurePosixPath', 252)
 
 
 # Appropriate locations to store config options for each OS.
+HEADLESS = daedalus_bee2.is_configured()
 _SETTINGS_ROOT: Path | None
-if WIN:
+if HEADLESS:
+    _SETTINGS_ROOT = daedalus_bee2.configuration().config_root
+elif WIN:
     _SETTINGS_ROOT = Path(os.environ['APPDATA'])
 elif MAC:
     _SETTINGS_ROOT = Path('~/Library/Preferences/').expanduser()
@@ -100,7 +104,7 @@ else:
     _SETTINGS_ROOT = None
 
 # We always go in a BEE2 subfolder
-if _SETTINGS_ROOT is not None:
+if _SETTINGS_ROOT is not None and not HEADLESS:
     _SETTINGS_ROOT /= 'BEEMOD2'
 
     # If testing, redirect to a subdirectory so the real configs aren't touched.
@@ -110,6 +114,8 @@ if _SETTINGS_ROOT is not None:
 
 def get_git_version(inst_path: Path | str) -> str:
     """Load the version from Git history."""
+    if HEADLESS:
+        return daedalus_bee2.configuration().versions[Path(inst_path).name]
     import versioningit
     return versioningit.get_version(
         project_dir=inst_path,
@@ -140,7 +146,7 @@ except ImportError:
     BEE_VERSION = get_git_version(_INSTALL_ROOT)
     HA_VERSION = get_git_version(_INSTALL_ROOT / 'hammeraddons')
     FROZEN = False
-    DEV_MODE = True
+    DEV_MODE = not HEADLESS
 else:
     FROZEN = True
     # This special attribute is set by PyInstaller to our folder.

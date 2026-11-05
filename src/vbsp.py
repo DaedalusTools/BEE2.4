@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from collections import defaultdict, Counter
 from operator import itemgetter
 from io import StringIO
+from pathlib import Path
 import os
 import sys
 import shutil
@@ -15,6 +16,7 @@ from aioresult import ResultCapture
 from srctools import AtomicWriter, Keyvalues, Vec, FrozenVec, Angle
 from srctools.dmx import Element
 from srctools.game import Game
+from srctools.filesys import FileSystem
 from srctools.vmf import VMF, Entity, Output
 import async_util
 import attrs
@@ -131,14 +133,31 @@ async def load_settings() -> tuple[
         )
         sys.exit(1)
 
-    vconf = res_vconf.result()
+    return apply_settings(
+        res_vconf.result(), res_packlist.result(), res_editor.result(),
+        res_corr.result(), res_dmx_conf.result(),
+    )
+
+
+def apply_settings(
+    vconf: Keyvalues,
+    packlists: Keyvalues,
+    editor_list: object,
+    corridor_conf: object,
+    compiler_config: config.Config,
+) -> tuple[
+    antlines.IndicatorStyle,
+    dict[utils.ObjectID, editoritems.Item],
+    corridor.ExportedConf,
+]:
+    """Apply parsed compiler inputs without cwd-relative files or pickle decoding."""
     tex_block = Keyvalues('Textures', list(vconf.find_children('textures')))
 
     texturing.load_config(tex_block)
 
     # Load in our main configs...
     options.load(vconf.find_all('Options'))
-    config.COMPILER.merge_conf(res_dmx_conf.result())
+    config.COMPILER.merge_conf(compiler_config)
     utils.DEV_MODE = options.DEV_MODE()
 
     # Configuration properties for styles.
@@ -150,7 +169,6 @@ async def load_settings() -> tuple[
     # The pickle could have produced anything.
     id_to_item: dict[utils.ObjectID, editoritems.Item] = {}
 
-    editor_list = res_editor.result()
     if not isinstance(editor_list, list):
         raise ValueError(f'Invalid list of editor items, got: {editor_list!r}')
     for item in editor_list:
@@ -175,7 +193,7 @@ async def load_settings() -> tuple[
         indicators = attrs.evolve(indicators, toggle_var='')
 
     # Parse packlist data.
-    packing.parse_packlists(res_packlist.result())
+    packing.parse_packlists(packlists)
 
     # Parse all the conditions.
     for cond in vconf.find_all('conditions', 'condition'):
@@ -186,7 +204,6 @@ async def load_settings() -> tuple[
     barriers.parse_conf(vconf)
 
     # Selected corridors.
-    corridor_conf = res_corr.result()
     if not isinstance(corridor_conf, corridor.ExportedConf):
         raise ValueError(f'Invalid corridor config, got {corridor_conf!r}')
 
@@ -1636,77 +1653,12 @@ async def main(argv: list[str]) -> None:
         ind_style, id_to_item, corridor_conf = res_settings.result()
         vmf = vmf_res.result()
 
-        coll = Collisions()
-
-        used_inst = instance_traits.set_traits(vmf, id_to_item, coll)
-        # Must be before corridors!
-        initial_voice_attrs = brushLoc.POS.read_from_map(vmf, id_to_item)
-
-        rand.init_seed(vmf)
-
-        info = corridor.analyse_and_modify(
-            vmf, corridor_conf,
-            elev_override=BEE2_config.get_bool('General', 'spawn_elev'),
-        )
+        coll, info, used_inst = analyse_peti_map(vmf, id_to_item, corridor_conf)
         is_publishing = info.is_publishing
-        info.set_attr(*initial_voice_attrs)
-
-        ant, side_to_antline = antlines.parse_antlines(vmf)
-
-        write_itemid_list(vmf, used_inst)
-
-        # Requires instance traits!
-        connections.calc_connections(
-            vmf, ant,
-            shape_frame_mat=texturing.OVERLAYS.get_all('shapeframe', False),
-            enable_shape_frame=settings['style_vars']['enableshapesignageframe'],
-            ind_style=ind_style,
+        await transform_peti_map(
+            vmf, res_game.result(), coll, info, used_inst, ind_style,
+            voice_data_res.result(),
         )
-        change_ents(vmf)
-
-        fizzler.parse_map(vmf, info)
-        barriers.parse_map(vmf, connections.ITEMS)
-        # We have barriers, pass to our error display.
-        errors.load_barriers(barriers.BARRIERS)
-
-        tiling.gen_tile_temp()
-        tiling.analyse_map(vmf, side_to_antline)
-
-        del side_to_antline
-        # We have tiles, pass to our error display.
-        errors.load_tiledefs(tiling.TILES.values(), brushLoc.POS)
-
-        await texturing.setup(res_game.result(), vmf, list(tiling.TILES.values()))
-
-        conditions.check_all(vmf, coll, info, voice_data_res.result())
-        add_extra_ents(vmf, info)
-
-        LOGGER.info('Generating tiles...')
-        if texturing.NEW_TILE_GEN:
-            tiling_gen.generate_brushes(vmf)
-        else:
-            tiling.generate_brushes(vmf)
-        LOGGER.info('Generating goop...')
-        tiling.generate_goo(vmf)
-        tiling.bind_overlays()
-
-        faithplate.gen_faithplates(vmf, info.has_attr('superposition'))
-        change_overlays(vmf)
-        fix_worldspawn(vmf, info)
-
-        if utils.DEV_MODE:
-            coll.export_debug(vmf, vis_name='collisions')
-        coll.export_vscript(vmf)
-
-        # Ensure all VMF outputs use the correct separator.
-        for ent in vmf.entities:
-            for out in ent.outputs:
-                out.comma_sep = False
-        # Set this so VRAD can know.
-        vmf.spawn['BEE2_is_preview'] = info.is_preview
-        # Ensure VRAD knows that the map is PeTI, it can't figure that out
-        # from parameters.
-        vmf.spawn['BEE2_is_peti'] = True
 
         # Save and run VBSP. If this leaks, this will raise UserError, and we'll compile again.
         save(vmf, new_path)
@@ -1753,3 +1705,78 @@ async def main(argv: list[str]) -> None:
             )
 
     LOGGER.info("BEE2 VBSP hook finished!")
+
+
+def analyse_peti_map(
+    vmf: VMF,
+    id_to_item: dict[utils.ObjectID, editoritems.Item],
+    corridor_conf: corridor.ExportedConf,
+) -> tuple[Collisions, corridor.Info, set[str]]:
+    """Analyse caller-owned PETI input after compiler settings have been applied."""
+    coll = Collisions()
+    used_inst = instance_traits.set_traits(vmf, id_to_item, coll)
+    # Must be before corridors!
+    initial_voice_attrs = brushLoc.POS.read_from_map(vmf, id_to_item)
+    rand.init_seed(vmf)
+    info = corridor.analyse_and_modify(
+        vmf, corridor_conf,
+        elev_override=BEE2_config.get_bool('General', 'spawn_elev'),
+    )
+    info.set_attr(*initial_voice_attrs)
+    return coll, info, used_inst
+
+
+async def transform_peti_map(
+    vmf: VMF,
+    game: Game,
+    coll: Collisions,
+    info: corridor.Info,
+    used_inst: Iterable[str],
+    ind_style: antlines.IndicatorStyle,
+    voice: QuoteInfo,
+    *,
+    material_folder: Path | None = None,
+    filesystem: FileSystem | None = None,
+) -> None:
+    """Transform analysed input in place, without saving or launching Valve tools."""
+    ant, side_to_antline = antlines.parse_antlines(vmf)
+    write_itemid_list(vmf, used_inst)
+    connections.calc_connections(
+        vmf, ant,
+        shape_frame_mat=texturing.OVERLAYS.get_all('shapeframe', False),
+        enable_shape_frame=settings['style_vars']['enableshapesignageframe'],
+        ind_style=ind_style,
+    )
+    change_ents(vmf)
+    fizzler.parse_map(vmf, info)
+    barriers.parse_map(vmf, connections.ITEMS)
+    errors.load_barriers(barriers.BARRIERS)
+    tiling.gen_tile_temp()
+    tiling.analyse_map(vmf, side_to_antline)
+    del side_to_antline
+    errors.load_tiledefs(tiling.TILES.values(), brushLoc.POS)
+    await texturing.setup(
+        game, vmf, list(tiling.TILES.values()),
+        material_folder=material_folder, filesystem=filesystem,
+    )
+    conditions.check_all(vmf, coll, info, voice)
+    add_extra_ents(vmf, info)
+    LOGGER.info('Generating tiles...')
+    if texturing.NEW_TILE_GEN:
+        tiling_gen.generate_brushes(vmf)
+    else:
+        tiling.generate_brushes(vmf)
+    LOGGER.info('Generating goop...')
+    tiling.generate_goo(vmf)
+    tiling.bind_overlays()
+    faithplate.gen_faithplates(vmf, info.has_attr('superposition'))
+    change_overlays(vmf)
+    fix_worldspawn(vmf, info)
+    if utils.DEV_MODE:
+        coll.export_debug(vmf, vis_name='collisions')
+    coll.export_vscript(vmf)
+    for ent in vmf.entities:
+        for out in ent.outputs:
+            out.comma_sep = False
+    vmf.spawn['BEE2_is_preview'] = info.is_preview
+    vmf.spawn['BEE2_is_peti'] = True

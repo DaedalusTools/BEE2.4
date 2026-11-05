@@ -33,11 +33,17 @@ from BEE2_config import ConfigFile
 from config import Config
 from corridor import CORRIDOR_COUNTS, Direction, GameMode
 from editoritems import Item as EditorItem, Renderable, RenderableType
-from loadScreen import MAIN_OBJ as LOAD_OBJ, MAIN_PAK as LOAD_PAK
 from transtoken import AppError, TransToken, TransTokenSource
 import async_util
 import consts
 import utils
+import daedalus_bee2
+
+if utils.HEADLESS:
+    from daedalus_bee2 import OBJECT_PROGRESS as LOAD_OBJ, PACKAGE_PROGRESS as LOAD_PAK
+    from daedalus_bee2 import own_filesystem
+else:
+    from loadScreen import MAIN_OBJ as LOAD_OBJ, MAIN_PAK as LOAD_PAK
 
 
 __all__ = [
@@ -914,7 +920,7 @@ async def find_packages(errors: ErrorUI, packset: PackagesSet, pak_dir: Path) ->
     """
     found_pak = False
     try:
-        contents = list(pak_dir.iterdir())
+        contents = [pak_dir] if (pak_dir / 'info.txt').is_file() else list(pak_dir.iterdir())
     except FileNotFoundError:
         errors.add(TRANS_MISSING_PAK_DIR.format(path=pak_dir))
         return False
@@ -936,7 +942,9 @@ async def find_packages(errors: ErrorUI, packset: PackagesSet, pak_dir: Path) ->
                 ext = name.suffix.casefold()
                 try:
                     if ext in ('.bee_pack', '.zip'):
-                        filesys = await trio.to_thread.run_sync(ZipFileSystem, name, abandon_on_cancel=True)
+                        filesys = await trio.to_thread.run_sync(
+                            ZipFileSystem, name, abandon_on_cancel=not utils.HEADLESS,
+                        )
                     elif ext == '.vpk':
                         filesys = await trio.to_thread.run_sync(VPKFileSystem, name, abandon_on_cancel=True)
                     else:
@@ -947,6 +955,8 @@ async def find_packages(errors: ErrorUI, packset: PackagesSet, pak_dir: Path) ->
                     errors.add(TRANS_INVALID_PAK_BAD_FORMAT.format(path=name))
                     continue
 
+            if utils.HEADLESS:
+                own_filesystem(filesys)
             # Valid packages must have an info.txt file!
             try:
                 info = await async_util.parse_kv1_fsys(filesys, 'info.txt')
@@ -1253,6 +1263,7 @@ async def parse_package(
     await LOAD_PAK.step(pack.id)
 
 
+@daedalus_bee2.isolate_package_logging
 async def parse_object(
     packset: PackagesSet,
     errors: ErrorUI,

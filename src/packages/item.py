@@ -38,6 +38,7 @@ import collisions
 import config
 import editoritems_vmf
 import utils
+import daedalus_bee2
 
 
 LOGGER = logger.get_logger(__name__)
@@ -1171,6 +1172,7 @@ async def parse_item_folder(
 
 
 # noinspection PyProtectedMember
+@daedalus_bee2.isolate_package_logging
 async def assign_styled_items(ctx: PackErrorInfo, all_styles: Iterable[Style], item: Item) -> None:
     """Handle inheritance across item folders.
 

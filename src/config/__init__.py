@@ -425,6 +425,10 @@ class ConfigSpec:
                 continue
             self._current = self._current.with_cls_map(cls, opt_map)
 
+    def replace_conf(self, config: Config) -> None:
+        """Replace configuration without notifying UI clients."""
+        self._current = config
+
     async def apply_multi(self, config: Config) -> None:
         """Merge the values into our config, then apply the changed types.
 

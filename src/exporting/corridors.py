@@ -18,6 +18,7 @@ from . import ExportData, STEPS, StepResource
 from packages.corridor import CorridorGroup
 import config
 import editoritems
+import packages
 
 
 LOGGER = srctools.logger.get_logger(__name__)
@@ -33,9 +34,26 @@ TRANS_MISSING_GROUP = TransToken.ui(
 @STEPS.add_step(prereq=[StepResource.EI_ITEMS], results=[StepResource.EI_DATA, StepResource.VCONF_DATA])
 async def step_corridor_conf(exp_data: ExportData) -> None:
     """Override editoritems with the new corridor specifier."""
-    style_id = exp_data.selected_style.id
+    result, exp_data.config = await assemble_corridors(
+        exp_data.packset, exp_data.selected_style, exp_data.all_items,
+        exp_data.config, exp_data.vbsp_conf,
+    )
+    LOGGER.info('Writing corridor configuration...')
+    pickle_data = await trio.to_thread.run_sync(pickle.dumps, result, pickle.HIGHEST_PROTOCOL)
+    await trio.Path(exp_data.game.abs_path('bin/bee2/corridors.bin')).write_bytes(pickle_data)
+
+
+async def assemble_corridors(
+    packset: packages.PackagesSet,
+    selected_style: packages.Style,
+    all_items: list[editoritems.Item],
+    compiler_config: config.Config,
+    vbsp_conf: srctools.Keyvalues,
+) -> tuple[ExportedConf, config.Config]:
+    """Assemble corridor configuration and editor instances without game writes."""
+    style_id = selected_style.id
     try:
-        group = exp_data.packset.obj_by_id(CorridorGroup, style_id)
+        group = packset.obj_by_id(CorridorGroup, style_id)
     except KeyError:
         raise AppError(TRANS_MISSING_GROUP.format(
             id=style_id,
@@ -82,13 +100,13 @@ async def step_corridor_conf(exp_data: ExportData) -> None:
         opt_id = Options.get_id(style_id, mode, direction)
         options_changed = False
         try:
-            exported_options = dict(exp_data.config.get(Options, opt_id).options)
+            exported_options = dict(compiler_config.get(Options, opt_id).options)
         except KeyError:
             exported_options = {}
             options_changed = True
 
         for corr in chosen:
-            exp_data.vbsp_conf.extend(await corr.config())
+            vbsp_conf.extend(await corr.config())
             for option in group.get_options(mode, direction, corr):
                 # If an option is not present in the config, add it.
                 if option.id not in exported_options:
@@ -97,7 +115,7 @@ async def step_corridor_conf(exp_data: ExportData) -> None:
                     options_changed = True
 
         if options_changed:
-            exp_data.config = exp_data.config.with_value(Options(exported_options), opt_id)
+            compiler_config = compiler_config.with_value(Options(exported_options), opt_id)
 
         export[mode, direction, attach] = [corr.strip_ui() for corr in chosen]
 
@@ -110,15 +128,9 @@ async def step_corridor_conf(exp_data: ExportData) -> None:
         options=group.options.copy(),
     )
 
-    # Now write out.
-    LOGGER.info('Writing corridor configuration...')
-    pickle_data = await trio.to_thread.run_sync(pickle.dumps, result, pickle.HIGHEST_PROTOCOL)
-    await trio.Path(exp_data.game.abs_path('bin/bee2/corridors.bin')).write_bytes(pickle_data)
-    del pickle_data
-
     # Change out all the instances in items to names following a pattern.
     # This allows the compiler to easily recognise. Also force a few specific options.
-    for item in exp_data.all_items:
+    for item in all_items:
         try:
             (mode, direction) = ID_TO_CORR[item.id]
         except KeyError:
@@ -143,3 +155,4 @@ async def step_corridor_conf(exp_data: ExportData) -> None:
             item.handle = editoritems.Handle.QUAD
         # Set desired facing to make them face upright, no matter what.
         item.facing = editoritems.DesiredFacing.UP
+    return result, compiler_config

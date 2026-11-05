@@ -1,7 +1,7 @@
 """Export signage configuration, and write the legend."""
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Final
 from pathlib import Path
 
@@ -14,7 +14,7 @@ import srctools.logger
 import trio.to_thread
 
 from app.img import Handle as ImgHandle
-from packages import CLEAN_STYLE, PakRef, Style
+from packages import CLEAN_STYLE, PackagesSet, PakRef, Style
 from packages.signage import (
     CELL_ANT_SIZE, CELL_SIGN_SIZE, LEGEND_SIZE, Signage, SignageLegend, SignStyle,
 )
@@ -88,12 +88,13 @@ def load_conn_icon(fsys: FileSystem, shape: str) -> Image.Image | None:
         raise
 
 
-@STEPS.add_step(prereq=[StepResource.VPK_WRITTEN], results=[StepResource.VCONF_DATA, StepResource.RES_SPECIAL])
-async def step_signage(exp_data: ExportData) -> None:
-    """Export the selected signage to the config, and produce the legend."""
+async def assemble_signage(
+    packset: PackagesSet, style: Style, selection: Iterable[tuple[str, str]],
+) -> tuple[Keyvalues, dict[int, ImgHandle]]:
+    """Resolve compiler signage separately from editor legend rendering."""
     # Timer value -> sign ID.
     sel_ids: list[tuple[str, str]] = [
-        *exp_data.selected(Signage.export_info),
+        *selection,
         # Special case, arrow is never selectable, but must always be exported.
         ('arrow', 'SIGN_ARROW'),
     ]
@@ -106,13 +107,13 @@ async def step_signage(exp_data: ExportData) -> None:
     for tim_id, sign_id in sel_ids:
         await trio.lowlevel.checkpoint()
         try:
-            sign = exp_data.packset.obj_by_id(Signage, sign_id)
+            sign = packset.obj_by_id(Signage, sign_id)
         except KeyError:
             errors.append(AppError(TRANS_MISSING_SELECTED.format(id=sign_id)))
             continue
         kv_block = Keyvalues(str(tim_id), [])
 
-        sty_sign = serialise(sign, kv_block, exp_data.selected_style)
+        sty_sign = serialise(sign, kv_block, style)
 
         for sub_name, sub_id in [
             ('primary', sign.prim_id),
@@ -120,7 +121,7 @@ async def step_signage(exp_data: ExportData) -> None:
         ]:
             if sub_id:
                 try:
-                    sub_sign = exp_data.packset.obj_by_id(Signage, sub_id)
+                    sub_sign = packset.obj_by_id(Signage, sub_id)
                 except KeyError:
                     errors.append(AppError(TRANS_MISSING_CHILD.format(
                         id=sign_id,
@@ -129,7 +130,7 @@ async def step_signage(exp_data: ExportData) -> None:
                     )))
                 else:
                     sub_block = Keyvalues(sub_name, [])
-                    serialise(sub_sign, sub_block, exp_data.selected_style)
+                    serialise(sub_sign, sub_block, style)
                     if sub_block:
                         kv_block.append(sub_block)
 
@@ -142,6 +143,16 @@ async def step_signage(exp_data: ExportData) -> None:
 
     if errors:
         raise ExceptionGroup('Signage Export', errors)
+
+    return conf, sel_icons
+
+
+@STEPS.add_step(prereq=[StepResource.VPK_WRITTEN], results=[StepResource.VCONF_DATA, StepResource.RES_SPECIAL])
+async def step_signage(exp_data: ExportData) -> None:
+    """Export the selected signage to the config, and produce the legend."""
+    conf, sel_icons = await assemble_signage(
+        exp_data.packset, exp_data.selected_style, exp_data.selected(Signage.export_info),
+    )
 
     fsys = await trio.to_thread.run_sync(exp_data.game.get_filesystem)
 
@@ -195,6 +206,21 @@ def make_legend(
     is_antline: bool,
 ) -> None:
     """Construct the legend texture for the signage."""
+    render_signage_legend(
+        exp.packset, exp.selected_style, sign_path, icons, is_antline, exp.warn_auth,
+    )
+
+
+def render_signage_legend(
+    packset: PackagesSet,
+    selected_style: Style,
+    sign_path: Path,
+    icons: Mapping[int, ImgHandle | ResultCapture[Image.Image | None] | Image.Image | None],
+    is_antline: bool,
+    warn_auth: Callable[[str, TransToken], None],
+    should_replace_existing: bool = True,
+) -> None:
+    """Render an owned legend without an installation export object."""
     cell_size = CELL_ANT_SIZE if is_antline else CELL_SIGN_SIZE
     legend = Image.new('RGBA', LEGEND_SIZE, (0, 0, 0, 0))
 
@@ -204,10 +230,10 @@ def make_legend(
     num_sheet: Image.Image | None = None
     background: Image.Image | None = None
     num_step = num_x = num_y = 0
-    for style in exp.selected_style.bases:
+    for style in selected_style.bases:
         trio.from_thread.check_cancelled()
         try:
-            legend_obj = exp.packset.obj_by_id(SignageLegend, style.id, warn=False)
+            legend_obj = packset.obj_by_id(SignageLegend, style.id, warn=False)
         except KeyError:
             pass
         else:
@@ -231,10 +257,10 @@ def make_legend(
                 num_x, num_y = legend_info.num_off
                 num_step, num_rem = divmod(num_sheet.width, 10)
                 if num_rem != 0:
-                    exp.warn_auth(legend_obj.pak_id, TRANS_INVALID_NUMBERS_WIDTH)
+                    warn_auth(legend_obj.pak_id, TRANS_INVALID_NUMBERS_WIDTH)
             break
     else:
-        exp.warn_auth(exp.selected_style.pak_id, TRANS_NO_OVERLAY)
+        warn_auth(selected_style.pak_id, TRANS_NO_OVERLAY)
         overlay = None
 
     for num, x, y in iter_ant_cells() if is_antline else iter_sign_cells():
@@ -246,6 +272,8 @@ def make_legend(
         else:
             if isinstance(handle, ImgHandle):
                 ico = handle.get_pil()
+            elif isinstance(handle, Image.Image) or handle is None:
+                ico = handle
             else:
                 ico = handle.result()
         if background is not None:
@@ -302,7 +330,7 @@ def make_legend(
     sign_path.parent.mkdir(parents=True, exist_ok=True)
     LOGGER.info('Writing {}...', sign_path)
 
-    with sign_path.open('wb') as f:
+    with sign_path.open('wb' if should_replace_existing else 'xb') as f:
         try:
             vtf.save(f)
         except NotImplementedError:
