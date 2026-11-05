@@ -63,7 +63,7 @@ def apply_widget_values(
         try:
             widget = widgets[conf_id]
         except KeyError:
-            raise ValueError(f'Unknown widget configuration "{conf_id}".') from None
+            continue
         if not widget.has_values:
             raise ValueError(f'Widget "{conf_id}" selects an item version, not compiler values.')
         if isinstance(widget, MultiWidget):

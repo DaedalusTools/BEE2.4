@@ -41,7 +41,6 @@ import daedalus_bee2
 
 if utils.HEADLESS:
     from daedalus_bee2 import OBJECT_PROGRESS as LOAD_OBJ, PACKAGE_PROGRESS as LOAD_PAK
-    from daedalus_bee2 import own_filesystem
 else:
     from loadScreen import MAIN_OBJ as LOAD_OBJ, MAIN_PAK as LOAD_PAK
 
@@ -913,14 +912,16 @@ def get_loaded_packages() -> PackagesSet:
 LOADED = AsyncValue(PackagesSet())
 
 
-async def find_packages(errors: ErrorUI, packset: PackagesSet, pak_dir: Path) -> bool:
+async def find_packages(
+    errors: ErrorUI, packset: PackagesSet, pak_dir: Path, loose_only: bool = False,
+) -> bool:
     """Search a folder for packages, recursing if necessary.
 
     This returns True if at least one package was found.
     """
     found_pak = False
     try:
-        contents = [pak_dir] if (pak_dir / 'info.txt').is_file() else list(pak_dir.iterdir())
+        contents = [pak_dir] if (pak_dir / 'info.txt').is_file() else sorted(pak_dir.iterdir())
     except FileNotFoundError:
         errors.add(TRANS_MISSING_PAK_DIR.format(path=pak_dir))
         return False
@@ -938,6 +939,8 @@ async def find_packages(errors: ErrorUI, packset: PackagesSet, pak_dir: Path) ->
             filesys: FileSystem
             if name.is_dir():
                 filesys = RawFileSystem(name)
+            elif loose_only:
+                continue
             else:
                 ext = name.suffix.casefold()
                 try:
@@ -955,8 +958,6 @@ async def find_packages(errors: ErrorUI, packset: PackagesSet, pak_dir: Path) ->
                     errors.add(TRANS_INVALID_PAK_BAD_FORMAT.format(path=name))
                     continue
 
-            if utils.HEADLESS:
-                own_filesystem(filesys)
             # Valid packages must have an info.txt file!
             try:
                 info = await async_util.parse_kv1_fsys(filesys, 'info.txt')
@@ -966,7 +967,7 @@ async def find_packages(errors: ErrorUI, packset: PackagesSet, pak_dir: Path) ->
                     LOGGER.debug('Checking subdir "{}" for packages...', name)
                     children.append(ResultCapture.start_soon(
                         nursery, find_packages,
-                        errors, packset, name,
+                        errors, packset, name, loose_only,
                     ))
                 else:
                     # Just a warning, could be something else.
@@ -1010,11 +1011,12 @@ async def _load_packages(
     packset: PackagesSet,
     pak_dirs: list[Path],
     errors: ErrorUI,
+    loose_only: bool = False,
 ) -> None:
     """Scan and read in all packages."""
     async with trio.open_nursery() as find_nurs:
         find_sources = [
-            (pak_dir, ResultCapture.start_soon(find_nurs, find_packages, errors, packset, pak_dir))
+            (pak_dir, ResultCapture.start_soon(find_nurs, find_packages, errors, packset, pak_dir, loose_only))
             for pak_dir in pak_dirs
         ]
     # Once they've all run, check if any sources failed to find any packages - that's probably an error.

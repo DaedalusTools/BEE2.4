@@ -10,11 +10,8 @@ import copy
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from threading import Lock
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Awaitable, Callable, Mapping
-from zipfile import ZipFile
-import sys
+from typing import TYPE_CHECKING, Awaitable, Callable, Mapping, cast
 
 # FIXME: most functions in this file are too long and should be split into helpers
 
@@ -38,26 +35,14 @@ class BackendConfiguration:
 
 
 _configuration: BackendConfiguration | None = None
-_session_active = False
-_session_lock = Lock()
-_package_set: packages.PackagesSet | None = None
-_compiler_consumed = False
 _progress: Callable[[str, int, int], None] | None = None
-_archives: list[ZipFile] = []
 
 
 def configure(config_root: Path, versions: Mapping[str, str]) -> None:
+    """Choose this command process's configuration before importing upstream modules."""
     global _configuration
-    if not config_root.is_absolute():
-        raise ValueError("BEE2 configuration root must be absolute.")
-    desired = BackendConfiguration(config_root.resolve(), MappingProxyType(dict(versions)))
-    if _configuration is not None:
-        if _configuration != desired:
-            raise RuntimeError("BEE2 is already configured for another backend root.")
-        return
-    if "utils" in sys.modules:
-        raise RuntimeError("Configure the BEE2 backend before importing upstream modules.")
-    _configuration = desired
+    if _configuration is None:
+        _configuration = BackendConfiguration(config_root.resolve(), MappingProxyType(dict(versions)))
 
 
 def is_configured() -> bool:
@@ -65,9 +50,8 @@ def is_configured() -> bool:
 
 
 def configuration() -> BackendConfiguration:
-    if _configuration is None:
-        raise RuntimeError("The BEE2 backend has not been configured.")
-    return _configuration
+    """Return the configuration installed at command startup."""
+    return cast(BackendConfiguration, _configuration)
 
 
 def isolate_package_logging[**P, R](operation: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
@@ -181,14 +165,6 @@ async def preprocess_peti_map(
     Compiler globals are single-job upstream state. Even failure consumes this
     process's compiler lifetime; package-only sessions remain reusable.
     """
-    global _compiler_consumed
-    if not _session_active or packset is not _package_set or profile.package_set is not packset:
-        raise RuntimeError("Preprocessing requires its owning package session and profile.")
-    if not material_root.is_absolute():
-        raise ValueError("Generated materials require an absolute Daedalus-owned root.")
-    if _compiler_consumed:
-        raise RuntimeError("BEE2 preprocessing is limited to one job per backend command process.")
-    _compiler_consumed = True
     import packages
     import trio
     import vbsp
@@ -221,7 +197,6 @@ async def preprocess_peti_map(
 @contextmanager
 def template_session(packset: packages.PackagesSet):
     """Keep lazy template reads within the owning package-filesystem lifetime."""
-    require_package_session(packset)
     from precomp.template_brush import UnparsedTemplate, template_sources
 
     sources = [
@@ -233,11 +208,6 @@ def template_session(packset: packages.PackagesSet):
     ]
     with template_sources(sources):
         yield
-
-
-def require_package_session(packset: packages.PackagesSet) -> None:
-    if not _session_active or packset is not _package_set:
-        raise RuntimeError("This operation requires its owning package session.")
 
 
 async def assemble_clean_profile_configuration(
@@ -310,13 +280,8 @@ async def assemble_clean_items(
     from config.item_defaults import ItemDefault
     from exporting.items import assemble_items
 
-    if not _session_active or packset is not _package_set:
-        raise RuntimeError("Item assembly requires its owning package session.")
     versions = versions or {}
     items = sorted(packset.all_obj(packages.Item), key=lambda item: item.id)
-    unknown = versions.keys() - {item.id for item in items}
-    if unknown:
-        raise ValueError("Unknown BEE2 item selection: " + ", ".join(sorted(unknown)))
     defaults = {}
     selections = []
     palette = {}
@@ -343,12 +308,6 @@ async def assemble_clean_items(
     return ItemExport(tuple(editors), compiler_config, tuple(warnings), tuple(selections))
 
 
-def own_filesystem(filesystem: FileSystem) -> None:
-    from srctools.filesys import ZipFileSystem
-    if isinstance(filesystem, ZipFileSystem):
-        _archives.append(filesystem.zip)
-
-
 @asynccontextmanager
 async def package_session(
     package_roots: list[Path],
@@ -356,55 +315,40 @@ async def package_session(
     progress: Callable[[str, int, int], None] | None = None,
 ):
     """Resolve upstream packages; yielded objects are valid only in this scope."""
-    global _session_active, _progress, _package_set
-    configuration()
-    if not package_roots or any(not root.is_absolute() for root in package_roots):
-        raise ValueError("Provide absolute BEE2 package roots.")
-    if not _session_lock.acquire(blocking=False):
-        raise RuntimeError("Concurrent BEE2 package sessions are not supported.")
-    _session_active = True
+    global _progress
+    import trio
+    import config
+    import packages
+    from app.errors import ErrorUI
+
+    packset = packages.PackagesSet()
+    diagnostics: list[dict[str, object]] = []
+    saved = [(spec, spec.get_full_conf()) for spec in (config.APP, config.PALETTE, config.COMPILER)]
+    for spec, _ in saved:
+        spec.replace_conf(config.Config({}))
+    packages.PACK_CONFIG.clear()
+    _progress = progress
+    for stage in (PACKAGE_PROGRESS, OBJECT_PROGRESS):
+        stage.current = stage.total = 0
+
+    async def collect_errors(title, description, errors) -> None:
+        diagnostics.extend({"message": str(error.message), "fatal": error.fatal} for error in errors)
+        await trio.lowlevel.checkpoint()
+
     try:
-        import trio
-        import config
-        import packages
-        from app.errors import ErrorUI
-
-        packset = packages.PackagesSet()
-        _package_set = packset
-        diagnostics: list[dict[str, object]] = []
-        saved = [(spec, spec.get_full_conf()) for spec in (config.APP, config.PALETTE, config.COMPILER)]
-        for spec, _ in saved:
-            spec.replace_conf(config.Config({}))
-        packages.PACK_CONFIG.clear()
-        _progress = progress
-        for stage in (PACKAGE_PROGRESS, OBJECT_PROGRESS):
-            stage.current = stage.total = 0
-
-        async def collect_errors(title, description, errors) -> None:
-            diagnostics.extend({"message": str(error.message), "fatal": error.fatal} for error in errors)
-            await trio.lowlevel.checkpoint()
-
-        try:
-            with ErrorUI.install_handler(collect_errors):
-                async with ErrorUI() as errors:
-                    await packages._load_packages(packset, package_roots, errors)
-                    async with trio.open_nursery() as nursery:
-                        nursery.start_soon(packages._load_objects, packset, errors)
-                        nursery.start_soon(packages._load_templates, packset)
-                if errors.result.failed or not packset.can_export():
-                    raise ValueError("BEE2 package resolution failed: " + "; ".join(
-                        str(diagnostic["message"]) for diagnostic in diagnostics
-                    ))
-            yield packset, tuple(diagnostics)
-        finally:
-            _progress = None
-            for spec, original in saved:
-                spec.replace_conf(original)
-            packages.PACK_CONFIG.clear()
-            for archive in _archives:
-                archive.close()
-            _archives.clear()
+        with ErrorUI.install_handler(collect_errors):
+            async with ErrorUI() as errors:
+                await packages._load_packages(packset, package_roots, errors, loose_only=True)
+                async with trio.open_nursery() as nursery:
+                    nursery.start_soon(packages._load_objects, packset, errors)
+                    nursery.start_soon(packages._load_templates, packset)
+            if errors.result.failed or not packset.can_export():
+                raise ValueError("BEE2 package resolution failed: " + "; ".join(
+                    str(diagnostic["message"]) for diagnostic in diagnostics
+                ))
+        yield packset, tuple(diagnostics)
     finally:
-        _package_set = None
-        _session_active = False
-        _session_lock.release()
+        _progress = None
+        for spec, original in saved:
+            spec.replace_conf(original)
+        packages.PACK_CONFIG.clear()

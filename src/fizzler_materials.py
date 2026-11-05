@@ -38,9 +38,7 @@ MaterialModify
 
 
 async def generate_fizzler_side_materials(configuration: Keyvalues, material_root: Path) -> set[Path]:
-    """Write upstream edge materials below an absolute caller-owned materials root."""
-    if not material_root.is_absolute():
-        raise ValueError("Generated materials require an absolute caller-owned root.")
+    """Write upstream edge materials below the caller-owned materials root."""
     colors: dict[FrozenVec, tuple[float, str]] = {}
     for brush in configuration.find_all("Fizzlers", "Fizzler", "Brush"):
         color = brush["Side_color", ""]
